@@ -6,10 +6,19 @@ import { ChevronDown, ChevronRight, Info } from "lucide-react"
 import { useIssues } from "@/hooks/useIssues"
 import { useTeam } from "@/hooks/useTeam"
 import { addDays, todayIso } from "@/lib/jira-types"
-import { computeLoads, loadLevel, sprintWindow, utilization, type LoadLevel, type PersonLoad } from "@/lib/capacity"
+import {
+  computeLoads,
+  dailyRoleLoad,
+  loadLevel,
+  sprintWindow,
+  utilization,
+  type LoadLevel,
+  type PersonLoad,
+} from "@/lib/capacity"
 import { ROLE_LABEL, ROLES, type Role } from "@/lib/team-types"
 import { cn } from "@/lib/utils"
 import { IssueDrawer } from "@/components/IssueDrawer"
+import { DailyLoadChart } from "@/components/DailyLoadChart"
 import {
   Card,
   ErrorBox,
@@ -35,6 +44,9 @@ const LEVEL_STYLE: Record<LoadLevel, { bar: string; text: string; label: string 
   over: { bar: "bg-red-500", text: "text-red-700", label: "Over capacity" },
 }
 
+// "QA" stays upper-case mid-sentence; the others read as lower-case words.
+const roleNoun = (r: Role) => (r === "QA" ? "QA" : ROLE_LABEL[r].toLowerCase())
+
 const h = (n: number) => `${Math.round(n)}h`
 
 function pctText(e: Pick<PersonLoad, "load" | "capacity" | "buffer">) {
@@ -47,6 +59,7 @@ export default function PeoplePage() {
   const [sprint, setSprint] = useState<SprintChoice>("sprint")
   const [modeChoice, setMode] = useState<Mode>("remaining")
   const [roleFilter, setRoleFilter] = useState<"" | Role>("")
+  const [chartRole, setChartRole] = useState<Role>("QA")
   const [query, setQuery] = useState("")
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [openKey, setOpenKey] = useState<string | null>(null)
@@ -66,6 +79,12 @@ export default function PeoplePage() {
     [issues, team.team, period, mode, today]
   )
 
+  const daily = useMemo(
+    () => (team.team ? dailyRoleLoad(issues, team.team, chartRole, { start: period.start, end: period.end, mode, today }) : []),
+    [issues, team.team, chartRole, period, mode, today]
+  )
+  const dailyOver = daily.filter((d) => d.assigned + d.unassigned > d.capacity + 0.05)
+
   const shown = useMemo(() => {
     const q = query.trim().toLowerCase()
     return loads.filter((l) => (!roleFilter || l.role === roleFilter) && (!q || l.person.name.toLowerCase().includes(q)))
@@ -78,7 +97,17 @@ export default function PeoplePage() {
       const capacity = sum((l) => l.capacity)
       const buffer = sum((l) => l.buffer)
       const load = sum((l) => l.load)
-      return { role, people: people.length, capacity, buffer, load, free: capacity - buffer - load, over: people.filter((l) => loadLevel(l) === "over").length }
+      const unassigned = sum((l) => (l.unassigned ? l.load : 0))
+      return {
+        role,
+        people: people.filter((l) => !l.unassigned).length,
+        capacity,
+        buffer,
+        load,
+        unassigned,
+        free: capacity - buffer - load,
+        over: people.filter((l) => !l.unassigned && loadLevel(l) === "over").length,
+      }
     })
     return out
   }, [loads])
@@ -138,7 +167,7 @@ export default function PeoplePage() {
           <p>
             {noTeam
               ? "No team is set up yet, so roles are guessed from Jira and everyone gets the default hours per day. "
-              : "No QA people are set up yet, so QA hours aren't counted. "}
+              : "No QA people are set up yet, so all QA work shows as \u201cQA not assigned\u201d and the QA team has no capacity. "}
             Add people, roles, holidays and leave in <Link href="/team" className="font-semibold underline">Team setup</Link>.
           </p>
         </div>
@@ -172,11 +201,41 @@ export default function PeoplePage() {
                     <div><dt className="text-slate-500">Bug buffer</dt><dd className="font-semibold tabular-nums">{h(t.buffer)}</dd></div>
                     <div><dt className="text-slate-500">Planned</dt><dd className="font-semibold tabular-nums">{h(t.load)}</dd></div>
                   </dl>
-                  {t.over > 0 && <p className="mt-2 text-xs font-medium text-red-600">{t.over} over capacity</p>}
+                  {t.unassigned > 0 && (
+                    <p className="mt-2 text-xs font-medium text-amber-700">{h(t.unassigned)} of planned work has nobody assigned</p>
+                  )}
+                  {t.over > 0 && <p className="mt-1 text-xs font-medium text-red-600">{t.over} over capacity</p>}
                 </Card>
               )
             })}
           </div>
+
+          <Card className="p-5">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold text-slate-900">{ROLE_LABEL[chartRole]} bandwidth, day by day</h2>
+                <p className="text-xs text-slate-500">
+                  Hours of {roleNoun(chartRole)} work scheduled on each working day (from each card&apos;s dates in Jira) against
+                  the hours the {roleNoun(chartRole)} team has that day.
+                  {dailyOver.length > 0 && (
+                    <span className="font-medium text-red-600">
+                      {" "}Over capacity on {dailyOver.length} day{dailyOver.length === 1 ? "" : "s"}.
+                    </span>
+                  )}
+                </p>
+              </div>
+              <Segmented<Role>
+                value={chartRole}
+                onChange={setChartRole}
+                options={ROLES.map((r) => ({ value: r, label: ROLE_LABEL[r] }))}
+              />
+            </div>
+            {daily.length ? (
+              <DailyLoadChart rows={daily} />
+            ) : (
+              <p className="py-10 text-center text-sm text-slate-400">No working days in this period.</p>
+            )}
+          </Card>
 
           <div className="flex flex-wrap items-center gap-2">
             <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search people…" className={cn(inputClass, "w-56")} />
@@ -221,12 +280,14 @@ export default function PeoplePage() {
                             <td className="px-5 py-3">
                               <span className="flex items-center gap-2 font-medium text-slate-900">
                                 {open ? <ChevronDown className="h-4 w-4 text-slate-400" /> : <ChevronRight className="h-4 w-4 text-slate-400" />}
-                                {l.person.name}
-                                {!l.member && <span className="rounded bg-slate-100 px-1.5 text-[10px] font-normal text-slate-500">not in team setup</span>}
+                                <span className={cn(l.unassigned && "italic text-amber-800")}>{l.person.name}</span>
+                                {!l.member && !l.unassigned && (
+                                  <span className="rounded bg-slate-100 px-1.5 text-[10px] font-normal text-slate-500">not in team setup</span>
+                                )}
                               </span>
                             </td>
                             <td className="px-3 py-3 text-right tabular-nums">{cards}</td>
-                            <td className="px-3 py-3 text-right tabular-nums">{h(l.capacity)}</td>
+                            <td className="px-3 py-3 text-right tabular-nums">{l.unassigned ? "—" : h(l.capacity)}</td>
                             <td className="px-3 py-3 text-right tabular-nums text-slate-500">{l.leaveDays ? `${Math.round(l.leaveDays * 10) / 10}d` : "—"}</td>
                             <td className="px-3 py-3 text-right tabular-nums">
                               {h(l.load)}
@@ -239,15 +300,19 @@ export default function PeoplePage() {
                               )}
                             </td>
                             <td className="px-3 py-3">
-                              <div className="flex items-center gap-2">
-                                <div className="flex-1"><UtilBar load={l.load} capacity={l.capacity} buffer={l.buffer} level={level} /></div>
-                                <span className={cn("w-12 text-right text-xs font-semibold tabular-nums", LEVEL_STYLE[level].text)}>{pctText(l)}</span>
-                              </div>
+                              {l.unassigned ? (
+                                <span className="text-xs font-medium text-amber-700">Needs someone</span>
+                              ) : (
+                                <div className="flex items-center gap-2">
+                                  <div className="flex-1"><UtilBar load={l.load} capacity={l.capacity} buffer={l.buffer} level={level} /></div>
+                                  <span className={cn("w-12 text-right text-xs font-semibold tabular-nums", LEVEL_STYLE[level].text)}>{pctText(l)}</span>
+                                </div>
+                              )}
                             </td>
-                            <td className={cn("px-3 py-3 text-right tabular-nums", l.nextWeekFree < 0 ? "text-red-600" : "text-slate-700")}>
-                              {l.nextWeekFree < 0 ? `−${h(-l.nextWeekFree)}` : h(l.nextWeekFree)}
+                            <td className={cn("px-3 py-3 text-right tabular-nums", !l.unassigned && l.nextWeekFree < 0 ? "text-red-600" : "text-slate-700")}>
+                              {l.unassigned ? "—" : l.nextWeekFree < 0 ? `−${h(-l.nextWeekFree)}` : h(l.nextWeekFree)}
                             </td>
-                            <td className="px-5 py-3 text-slate-700">{l.freeFrom ? fmtDate(l.freeFrom) : "Now"}</td>
+                            <td className="px-5 py-3 text-slate-700">{l.unassigned ? "—" : l.freeFrom ? fmtDate(l.freeFrom) : "Now"}</td>
                           </tr>
                           {open && (
                             <tr className="bg-slate-50/60">

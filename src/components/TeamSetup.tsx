@@ -27,6 +27,8 @@ function NoticeLine({ notice }: { notice: Notice }) {
   return <p className={cn("text-sm", notice.ok ? "text-emerald-700" : "text-red-600")}>{notice.text}</p>
 }
 
+const TESTING_RE = /test|\bqa\b|uat/i
+
 interface Candidate {
   person: Person
   suggested: Role
@@ -46,7 +48,8 @@ function jiraPeople(issues: IssueSummary[]): Candidate[] {
   issues.forEach((i) => {
     add(i.delivery.beDev, "BE")
     add(i.delivery.feDev, "FE")
-    add(i.assignee, null)
+    // Whoever holds a card while it's in testing is very likely QA.
+    add(i.assignee, TESTING_RE.test(i.status) ? "QA" : null)
   })
   return [...seen.values()]
     .map((e) => {
@@ -55,7 +58,11 @@ function jiraPeople(issues: IssueSummary[]): Candidate[] {
       return {
         person: e.person,
         suggested,
-        evidence: n ? `${ROLE_LABEL[suggested]} on ${n} card${n === 1 ? "" : "s"}` : null,
+        evidence: !n
+          ? null
+          : suggested === "QA"
+            ? `Assigned ${n} card${n === 1 ? "" : "s"} in testing`
+            : `${ROLE_LABEL[suggested]} on ${n} card${n === 1 ? "" : "s"}`,
       }
     })
     .sort((a, b) => a.person.name.localeCompare(b.person.name))
@@ -234,7 +241,7 @@ function MembersCard({
             <div className="space-y-4">
               {devs.length > 0 && (
                 <div>
-                  <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Developers (from Jira&apos;s developer fields)</h4>
+                  <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Developers and likely QA (from Jira)</h4>
                   <div className="grid gap-2 sm:grid-cols-2">
                     {devs.map((c) => (
                       <CandidateRow key={c.person.id} candidate={c} busy={busy === c.person.id} onAdd={(role) => save(c.person.id, c.person.name, role, null)} />

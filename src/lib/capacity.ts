@@ -14,7 +14,7 @@ import {
   type IssueSummary,
   type Person,
 } from "@/lib/jira-types"
-import { ROLES, type Role, type TeamData, type TeamMember } from "@/lib/team-types"
+import { ROLE_LABEL, ROLES, type Role, type TeamData, type TeamMember } from "@/lib/team-types"
 
 /* ----------------------------------------------------------------- calendar */
 
@@ -52,6 +52,15 @@ export interface Assignment {
   end: string | null
 }
 
+const UNASSIGNED_PREFIX = "__unassigned_"
+
+/** Stand-in "person" for work that has dates or hours in Jira but nobody to do it yet. */
+export function unassignedPerson(role: Role): Person {
+  return { id: UNASSIGNED_PREFIX + role, name: `${ROLE_LABEL[role]} not assigned` }
+}
+
+export const isUnassigned = (p: Person) => p.id.startsWith(UNASSIGNED_PREFIX)
+
 export function memberMap(team: TeamData): Map<string, TeamMember> {
   return new Map(team.members.map((m) => [m.accountId, m]))
 }
@@ -64,13 +73,22 @@ export function qaPerson(issue: IssueSummary, team: TeamData, members = memberMa
   return a && members.get(a.id)?.role === "QA" ? a : null
 }
 
+/**
+ * The back-end, front-end and QA work on a card. A phase with hours or dates
+ * but nobody on it is returned with the "not assigned" stand-in, so the work
+ * still shows on the timeline and still counts as demand on the team.
+ */
 export function assignmentsFor(issue: IssueSummary, team: TeamData, members = memberMap(team)): Assignment[] {
   const d = issue.delivery
   const out: Assignment[] = []
-  if (d.beDev) out.push({ issue, role: "BE", person: d.beDev, hours: d.beEstimate ?? 0, start: d.beStart, end: d.beEnd })
-  if (d.feDev) out.push({ issue, role: "FE", person: d.feDev, hours: d.feEstimate ?? 0, start: d.feStart, end: d.feEnd })
-  const qa = qaPerson(issue, team, members)
-  if (qa) out.push({ issue, role: "QA", person: qa, hours: d.qaEstimate ?? 0, start: d.qaStart, end: d.qaEnd })
+  const phase = (role: Role, person: Person | null, hours: number | null, start: string | null, end: string | null) => {
+    const hasWork = (hours ?? 0) > 0 || !!start || !!end
+    if (!person && !hasWork) return
+    out.push({ issue, role, person: person ?? unassignedPerson(role), hours: hours ?? 0, start, end })
+  }
+  phase("BE", d.beDev, d.beEstimate, d.beStart, d.beEnd)
+  phase("FE", d.feDev, d.feEstimate, d.feStart, d.feEnd)
+  phase("QA", qaPerson(issue, team, members), d.qaEstimate, d.qaStart, d.qaEnd)
   return out
 }
 
@@ -91,7 +109,7 @@ export function spread(a: Assignment, isWorking: IsWorkingDay): Map<string, numb
 }
 
 // Statuses at or after testing: development work on these cards is finished.
-const PAST_DEV_RE = /test|qa|uat|signoff|pre-?prod|production|go live|ready to go|live/i
+const PAST_DEV_RE = /test|\bqa\b|uat|signoff|pre-?prod|production|go live|ready to go|live/i
 
 /** True when a card has moved on to testing or release, so its dev hours are no longer owed. */
 export function devFinished(issue: IssueSummary): boolean {
@@ -137,6 +155,8 @@ export function availableHours(
 
 export interface PersonLoad {
   person: Person
+  /** True for the "not assigned" stand-in: demand with no capacity behind it. */
+  unassigned: boolean
   member: TeamMember | null
   /** Team role if set up, otherwise the role they have the most hours in. */
   role: Role | null
@@ -176,14 +196,16 @@ export function computeLoads(issues: IssueSummary[], team: TeamData, opts: LoadO
   const weekEnd = addDays(today, 6)
 
   const byPerson = new Map<string, PersonLoad>()
-  const entry = (person: Person): PersonLoad => {
+  const entry = (person: Person, role?: Role): PersonLoad => {
     let e = byPerson.get(person.id)
     if (!e) {
       const member = members.get(person.id) ?? null
+      const unassigned = isUnassigned(person)
       e = {
         person: member ? { id: person.id, name: member.name } : person,
+        unassigned,
         member,
-        role: member?.role ?? null,
+        role: member?.role ?? (unassigned ? role ?? null : null),
         assignments: [],
         capacity: 0,
         buffer: 0,
@@ -208,7 +230,7 @@ export function computeLoads(issues: IssueSummary[], team: TeamData, opts: LoadO
     for (const a of assignmentsFor(issue, team, members)) {
       // From today, a card that's already in testing no longer needs developer time.
       if (remaining && a.role !== "QA" && devFinished(issue)) continue
-      const e = entry(a.person)
+      const e = entry(a.person, a.role)
       const roleHours = hoursByRole.get(a.person.id) ?? { BE: 0, FE: 0, QA: 0 }
       roleHours[a.role] += a.hours
       hoursByRole.set(a.person.id, roleHours)
@@ -248,18 +270,80 @@ export function computeLoads(issues: IssueSummary[], team: TeamData, opts: LoadO
       const rh = hoursByRole.get(e.person.id)
       e.role = rh ? ROLES.reduce((best, r) => (rh[r] > rh[best] ? r : best), "BE" as Role) : null
     }
-    const avail = availableHours(e.person.id, start, end, team, isWorking, members)
+    // Unassigned work has no one's time behind it.
+    const avail = e.unassigned ? { hours: 0, leaveDays: 0 } : availableHours(e.person.id, start, end, team, isWorking, members)
     e.capacity = avail.hours
     e.leaveDays = avail.leaveDays
     e.buffer = e.role ? (e.capacity * team.settings.bugBuffer[e.role]) / 100 : 0
-    const week = availableHours(e.person.id, today, weekEnd, team, isWorking, members).hours
+    const week = e.unassigned ? 0 : availableHours(e.person.id, today, weekEnd, team, isWorking, members).hours
     e.nextWeekFree = week - (nextWeekScheduled.get(e.person.id) ?? 0)
     e.load = Math.round(e.load * 10) / 10
   }
 
   return [...byPerson.values()]
     .filter((e) => e.member || e.assignments.length)
-    .sort((a, b) => utilization(b) - utilization(a) || a.person.name.localeCompare(b.person.name))
+    .sort(
+      (a, b) =>
+        Number(a.unassigned) - Number(b.unassigned) ||
+        utilization(b) - utilization(a) ||
+        a.person.name.localeCompare(b.person.name)
+    )
+}
+
+/* -------------------------------------------------------------- daily view */
+
+export interface DailyLoad {
+  date: string
+  /** Hours of work scheduled that day for people on the team. */
+  assigned: number
+  /** Hours scheduled that day with nobody assigned. */
+  unassigned: number
+  /** Hours the team members in this role have that day, after leave. */
+  capacity: number
+}
+
+/**
+ * Day-by-day demand vs capacity for one role: how many hours of (say) QA are
+ * scheduled each working day, against how many QA hours the team has.
+ * Undated work can't be placed on a day and is left out here.
+ */
+export function dailyRoleLoad(issues: IssueSummary[], team: TeamData, role: Role, opts: LoadOptions): DailyLoad[] {
+  const members = memberMap(team)
+  const isWorking = makeCalendar(team)
+  const today = opts.today ?? todayIso()
+  const remaining = opts.mode === "remaining"
+  const start = remaining && today > opts.start ? today : opts.start
+  const days = eachDay(start, opts.end).filter(isWorking)
+  const rows = new Map<string, DailyLoad>(days.map((d) => [d, { date: d, assigned: 0, unassigned: 0, capacity: 0 }]))
+
+  for (const issue of issues) {
+    if (remaining && isDone(issue)) continue
+    for (const a of assignmentsFor(issue, team, members)) {
+      if (a.role !== role) continue
+      if (remaining && role !== "QA" && devFinished(issue)) continue
+      const spreadDays = spread(a, isWorking)
+      if (!spreadDays) continue
+      for (const [day, h] of spreadDays) {
+        const row = rows.get(day)
+        if (!row) continue
+        if (isUnassigned(a.person)) row.unassigned += h
+        else row.assigned += h
+      }
+    }
+  }
+
+  const people = team.members.filter((m) => m.role === role)
+  for (const row of rows.values()) {
+    for (const m of people) {
+      const perDay = m.hoursPerDay ?? team.settings.defaultHoursPerDay
+      row.capacity += perDay - leaveHours(m.accountId, row.date, perDay, team)
+    }
+  }
+  return [...rows.values()].map((r) => ({
+    ...r,
+    assigned: Math.round(r.assigned * 10) / 10,
+    unassigned: Math.round(r.unassigned * 10) / 10,
+  }))
 }
 
 /** Load as a share of usable capacity (capacity minus bug buffer). */

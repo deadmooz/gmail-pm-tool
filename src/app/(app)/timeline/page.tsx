@@ -4,7 +4,7 @@ import { useMemo, useState } from "react"
 import { useIssues } from "@/hooks/useIssues"
 import { useTeam } from "@/hooks/useTeam"
 import { addDays, diffDays, PROJECTS, todayIso, type IssueSummary } from "@/lib/jira-types"
-import { assignmentsFor, eachDay, makeCalendar, sprintWindow, type Assignment, type IsWorkingDay } from "@/lib/capacity"
+import { assignmentsFor, eachDay, isUnassigned, makeCalendar, sprintWindow, type Assignment, type IsWorkingDay } from "@/lib/capacity"
 import { ROLE_LABEL, type Role } from "@/lib/team-types"
 import { cn } from "@/lib/utils"
 import { IssueDrawer } from "@/components/IssueDrawer"
@@ -27,6 +27,7 @@ import {
 
 type SprintChoice = "sprint" | "next"
 type GroupBy = "project" | "person"
+type Range = { from: string; to: string }
 
 const DAY_W = 30
 const LABEL_W = 300
@@ -42,7 +43,7 @@ const defaultCalendar: IsWorkingDay = (d) => new Date(d + "T00:00:00Z").getUTCDa
 interface Row {
   id: string
   issue: IssueSummary
-  bars: { role: Role; start: string; end: string; hours: number; person: string }[]
+  bars: { role: Role; start: string; end: string; hours: number; person: string; unassigned: boolean }[]
 }
 
 interface Group {
@@ -58,7 +59,14 @@ function barsOf(assignments: Assignment[]): Row["bars"] {
     .map((a) => {
       const s = (a.start ?? a.end)!
       const e = (a.end ?? a.start)!
-      return { role: a.role, start: s <= e ? s : e, end: s <= e ? e : s, hours: a.hours, person: a.person.name }
+      return {
+        role: a.role,
+        start: s <= e ? s : e,
+        end: s <= e ? e : s,
+        hours: a.hours,
+        person: a.person.name,
+        unassigned: isUnassigned(a.person),
+      }
     })
 }
 
@@ -69,6 +77,7 @@ export default function TimelinePage() {
   const [owner, setOwner] = useState("")
   const [role, setRole] = useState<"" | Role>("")
   const [query, setQuery] = useState("")
+  const [range, setRange] = useState<Range | null>(null) // null = fit the sprint
   const [openKey, setOpenKey] = useState<string | null>(null)
   const { issues, error, loading, firstLoad, reload } = useIssues(project, sprint)
   const team = useTeam()
@@ -124,8 +133,18 @@ export default function TimelinePage() {
       .sort((a, b) => a.title.localeCompare(b.title))
   }, [filtered, team.team, groupBy, project, role])
 
-  // The visible date range: the sprint, stretched to cover every bar and deployment date shown.
+  // With a picked date range, only rows with a bar or deployment inside it are shown.
+  const visibleGroups = useMemo(() => {
+    if (!range) return groups
+    const touches = (r: Row) =>
+      r.bars.some((b) => b.start <= range.to && b.end >= range.from) ||
+      (!!r.issue.delivery.deployment && r.issue.delivery.deployment >= range.from && r.issue.delivery.deployment <= range.to)
+    return groups.map((g) => ({ ...g, rows: g.rows.filter(touches) })).filter((g) => g.rows.length)
+  }, [groups, range])
+
+  // The visible date range: the picked range, or the sprint stretched to cover every bar and deployment date shown.
   const days = useMemo(() => {
+    if (range) return eachDay(range.from, range.to)
     const win = sprintWindow(issues, sprint === "sprint" ? "active" : "future")
     const dates: string[] = []
     groups.forEach((g) =>
@@ -145,7 +164,34 @@ export default function TimelinePage() {
       end = addDays(start, 90)
     }
     return eachDay(addDays(start, -1), addDays(end, 1))
-  }, [groups, issues, sprint])
+  }, [groups, issues, sprint, range])
+
+  const sprintRange = useMemo(() => {
+    const w = sprintWindow(issues, sprint === "sprint" ? "active" : "future")
+    return w ? { from: w.start, to: w.end } : null
+  }, [issues, sprint])
+
+  function setFrom(from: string) {
+    if (!from) return
+    const to = range?.to ?? days[days.length - 1] ?? from
+    setRange({ from, to: to < from ? from : to })
+  }
+
+  function setTo(to: string) {
+    if (!to) return
+    const from = range?.from ?? days[0] ?? to
+    setRange({ from: from > to ? to : from, to })
+  }
+
+  const weekday = new Date(today + "T00:00:00Z").getUTCDay()
+  const monday = addDays(today, -((weekday + 6) % 7))
+  const presets: { label: string; range: Range | null }[] = [
+    { label: "Fit sprint", range: null },
+    { label: "This week", range: { from: monday, to: addDays(monday, 6) } },
+    { label: "Next 2 weeks", range: { from: today, to: addDays(today, 13) } },
+    { label: "Next 30 days", range: { from: today, to: addDays(today, 29) } },
+    ...(sprintRange ? [{ label: "Sprint dates", range: sprintRange }] : []),
+  ]
 
   const holidays = useMemo(() => new Map((team.team?.holidays ?? []).map((h) => [h.date, h.name])), [team.team])
   const rangeStart = days[0]
@@ -189,12 +235,53 @@ export default function TimelinePage() {
           <option value="FE">Front-end</option>
           <option value="QA">QA</option>
         </select>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <label className="flex items-center gap-1.5 text-sm text-slate-600">
+          From
+          <input
+            type="date"
+            value={range?.from ?? days[0] ?? ""}
+            onChange={(e) => setFrom(e.target.value)}
+            className={cn(inputClass, "w-40 py-1.5")}
+          />
+        </label>
+        <label className="flex items-center gap-1.5 text-sm text-slate-600">
+          To
+          <input
+            type="date"
+            value={range?.to ?? days[days.length - 1] ?? ""}
+            min={range?.from ?? days[0]}
+            onChange={(e) => setTo(e.target.value)}
+            className={cn(inputClass, "w-40 py-1.5")}
+          />
+        </label>
+        {presets.map((p) => {
+          const active = p.range === null ? range === null : range?.from === p.range.from && range?.to === p.range.to
+          return (
+            <button
+              key={p.label}
+              type="button"
+              onClick={() => setRange(p.range)}
+              className={cn(
+                "rounded-full border px-2.5 py-1 text-xs font-medium",
+                active ? "border-slate-900 bg-slate-900 text-white" : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+              )}
+            >
+              {p.label}
+            </button>
+          )
+        })}
         <div className="ml-auto flex items-center gap-3 text-xs text-slate-600">
           {(["BE", "FE", "QA"] as Role[]).map((r) => (
             <span key={r} className="flex items-center gap-1.5">
               <span className={cn("h-2.5 w-5 rounded-sm", ROLE_BAR[r])} /> {ROLE_LABEL[r]}
             </span>
           ))}
+          <span className="flex items-center gap-1.5">
+            <span className="h-2.5 w-5 rounded-sm border border-dashed border-slate-500 bg-slate-300/60" /> Nobody assigned
+          </span>
           <span className="flex items-center gap-1.5">
             <span className="h-3 w-3 rotate-45 bg-emerald-600" /> Deployment
           </span>
@@ -209,8 +296,10 @@ export default function TimelinePage() {
       )}
 
       {!error && !firstLoad && team.team && (
-        groups.length === 0 || days.length === 0 ? (
-          <Card className="p-10 text-center text-sm text-slate-500">No cards with dates to show.</Card>
+        visibleGroups.length === 0 || days.length === 0 ? (
+          <Card className="p-10 text-center text-sm text-slate-500">
+            {range ? "Nothing scheduled in this date range." : "No cards with dates to show."}
+          </Card>
         ) : (
           <Card className="overflow-x-auto">
             <div style={{ width: LABEL_W + width }}>
@@ -245,7 +334,7 @@ export default function TimelinePage() {
                 </div>
               </div>
 
-              {groups.map((g) => (
+              {visibleGroups.map((g) => (
                 <div key={g.id}>
                   <div className="flex border-b bg-slate-50">
                     <div className="sticky left-0 z-10 shrink-0 border-r bg-slate-50 px-4 py-2" style={{ width: LABEL_W }}>
@@ -325,8 +414,16 @@ function TimelineRow({
           <div
             key={`${b.role}-${i}`}
             title={`${ROLE_LABEL[b.role]} · ${b.person} · ${fmtDate(b.start)} → ${fmtDate(b.end)} · ${b.hours}h`}
-            className={cn("absolute h-2 rounded-full", ROLE_BAR[b.role])}
-            style={{ left: x(b.start) + 2, width: x(b.end) - x(b.start) + DAY_W - 4, top: 8 + i * 10 }}
+            className={cn(
+              "absolute h-2 rounded-full",
+              ROLE_BAR[b.role],
+              b.unassigned && "border border-dashed border-slate-700 opacity-45"
+            )}
+            style={{
+              left: Math.max(0, x(b.start)) + 2,
+              width: Math.max(4, Math.min(width, x(b.end) + DAY_W) - Math.max(0, x(b.start)) - 4),
+              top: 8 + i * 10,
+            }}
           />
         ))}
         {deploy && x(deploy) >= 0 && x(deploy) < width && (
