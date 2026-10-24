@@ -3,12 +3,16 @@ import { prisma } from "@/lib/prisma"
 import { decryptSecret } from "@/lib/crypto"
 import { HttpError } from "@/lib/http"
 import type {
+  BoardConfig,
+  Delivery,
   IssueDetail,
   IssueSummary,
-  IssueTransition,
   Person,
+  SprintRef,
   StatusCategory,
 } from "@/lib/jira-types"
+
+// PM Board only ever reads from Jira. There are deliberately no write calls in this module.
 
 export interface JiraCtx {
   domain: string
@@ -48,50 +52,25 @@ function jiraErrorMessage(data: unknown): string | null {
   return parts.length ? parts.join(" ") : null
 }
 
-/* ------------------------------------------------------- custom field lookup */
-
-// Custom fields have per-site ids (e.g. customfield_10031), so they are found by
-// name once per Jira site and cached for an hour.
-const fieldCache = new Map<string, { at: number; ids: Promise<CustomFieldIds> }>()
-
-interface CustomFieldIds {
-  productOwner: string | null
-}
-
-export function customFieldIds(ctx: JiraCtx): Promise<CustomFieldIds> {
-  const cached = fieldCache.get(ctx.domain)
-  if (cached && Date.now() - cached.at < 3600_000) return cached.ids
-  const ids = jiraRequest<{ id: string; name: string }[]>(ctx, "/rest/api/2/field").then((fields) => ({
-    productOwner: fields.find((f) => f.name.trim().toLowerCase() === "product owner")?.id ?? null,
-  }))
-  ids.catch(() => fieldCache.delete(ctx.domain))
-  fieldCache.set(ctx.domain, { at: Date.now(), ids })
-  return ids
-}
-
-export async function jiraRequest<T>(
-  ctx: JiraCtx,
-  path: string,
-  init: { method?: string; body?: unknown } = {}
-): Promise<T> {
+export async function jiraRequest<T>(ctx: JiraCtx, path: string, body?: unknown): Promise<T> {
   let res: Response
   try {
     res = await fetch(ctx.domain + path, {
-      method: init.method ?? "GET",
+      // POST is only used for search, which reads.
+      method: body !== undefined ? "POST" : "GET",
       headers: {
         Authorization: ctx.auth,
         Accept: "application/json",
-        ...(init.body !== undefined ? { "Content-Type": "application/json" } : {}),
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
       },
-      body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
       cache: "no-store",
-      signal: AbortSignal.timeout(20000),
+      signal: AbortSignal.timeout(25000),
     })
   } catch {
     throw new HttpError(502, "Couldn't reach Jira. Check the Jira site address and your network.")
   }
 
-  if (res.status === 204) return undefined as T
   const text = await res.text()
   let data: unknown = null
   try {
@@ -105,12 +84,70 @@ export async function jiraRequest<T>(
       throw new HttpError(400, "Jira rejected your email or API token. Update them in My Settings.", "JIRA_AUTH")
     }
     if (res.status === 403) {
-      throw new HttpError(403, jiraErrorMessage(data) ?? "Your Jira account doesn't have permission to do that.")
+      throw new HttpError(403, jiraErrorMessage(data) ?? "Your Jira account doesn't have permission to see that.")
     }
     const message = jiraErrorMessage(data) ?? `Jira returned an error (${res.status}).`
     throw new HttpError(res.status >= 500 ? 502 : res.status, message)
   }
   return data as T
+}
+
+/* ------------------------------------------------------- custom field lookup */
+
+// Custom fields have per-site ids (e.g. customfield_10485), so they are found by
+// name once per Jira site and cached for an hour. Names are compared lower-case
+// with trailing colons removed ("Back-End Dev Start Date :" -> "back-end dev start date").
+const CUSTOM_FIELD_NAMES = {
+  productOwner: ["product owner"],
+  sprint: ["sprint"],
+  beDev: ["back-end developer"],
+  feDev: ["front end developer", "front-end developer"],
+  beStart: ["back-end dev start date"],
+  beEnd: ["back-end dev end date"],
+  feStart: ["front dev start date"],
+  feEnd: ["front dev end date"],
+  qaStart: ["qa start date"],
+  qaEnd: ["qa end date"],
+  beEstimate: ["back-end developer estimate"],
+  feEstimate: ["front-end developer estimate"],
+  qaEstimate: ["qa estimate"],
+  deployment: ["deployment date"],
+  release: ["release date"],
+  revisedRelease: ["revised release date"],
+  prdSignoff: ["prd signoff"],
+  spmSignoff: ["spm signoff"],
+  uatSignoff: ["uat signoff"],
+  techFeasibility: ["technical feasibility"],
+} as const
+
+export type CustomFieldIds = Record<keyof typeof CUSTOM_FIELD_NAMES, string | null>
+
+const fieldCache = new Map<string, { at: number; ids: Promise<CustomFieldIds> }>()
+
+function normalizeFieldName(name: string) {
+  return name.toLowerCase().replace(/[\s:]+$/, "").replace(/\s+/g, " ").trim()
+}
+
+export function customFieldIds(ctx: JiraCtx): Promise<CustomFieldIds> {
+  const cached = fieldCache.get(ctx.domain)
+  if (cached && Date.now() - cached.at < 3600_000) return cached.ids
+  const ids = jiraRequest<{ id: string; name: string; custom?: boolean }[]>(ctx, "/rest/api/2/field").then((fields) => {
+    const custom = fields.filter((f) => f.custom)
+    const out = {} as CustomFieldIds
+    for (const [key, names] of Object.entries(CUSTOM_FIELD_NAMES) as [keyof CustomFieldIds, readonly string[]][]) {
+      out[key] = custom.find((f) => (names as readonly string[]).includes(normalizeFieldName(f.name)))?.id ?? null
+    }
+    return out
+  })
+  ids.catch(() => fieldCache.delete(ctx.domain))
+  fieldCache.set(ctx.domain, { at: Date.now(), ids })
+  return ids
+}
+
+/** JQL reference for a custom field, e.g. "cf[10485]". */
+export function jqlField(id: string | null): string | null {
+  const n = id?.match(/^customfield_(\d+)$/)?.[1]
+  return n ? `cf[${n}]` : null
 }
 
 /* ------------------------------------------------------------------ mapping */
@@ -122,8 +159,17 @@ interface RawPerson {
 }
 
 interface RawStatus {
+  id?: string
   name?: string
   statusCategory?: { key?: string }
+}
+
+interface RawSprint {
+  id?: number
+  name?: string
+  state?: string
+  startDate?: string
+  endDate?: string
 }
 
 interface RawIssue {
@@ -146,16 +192,14 @@ interface RawIssue {
   }
 }
 
-interface RawTransition {
-  id: string
-  name: string
-  to?: RawStatus
-}
-
 const LIST_FIELDS = [
   "summary", "issuetype", "status", "priority", "assignee", "reporter",
   "created", "updated", "duedate", "resolutiondate", "project", "labels",
 ]
+
+function requestedFields(custom: CustomFieldIds, extra: string[] = []): string[] {
+  return [...LIST_FIELDS, ...extra, ...Object.values(custom).filter((id): id is string => !!id)]
+}
 
 function person(raw: RawPerson | null | undefined): Person | null {
   if (!raw) return null
@@ -178,7 +222,65 @@ function customPerson(value: unknown): Person | null {
   return person(opt)
 }
 
-function mapIssue(raw: RawIssue, domain: string, fields: CustomFieldIds): IssueSummary {
+function customDate(value: unknown): string | null {
+  return typeof value === "string" && value.length >= 10 ? value.slice(0, 10) : null
+}
+
+function customNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null
+}
+
+function customOption(value: unknown): string | null {
+  const v = Array.isArray(value) ? value[0] : value
+  if (typeof v === "string") return v
+  if (v && typeof v === "object" && "value" in v && typeof v.value === "string") return v.value
+  return null
+}
+
+/** The sprint that matters for planning: the active one, else the next future one, else the latest. */
+function pickSprint(value: unknown): SprintRef | null {
+  if (!Array.isArray(value) || !value.length) return null
+  const sprints = (value as RawSprint[]).filter((s) => typeof s?.id === "number")
+  const byStart = (a: RawSprint, b: RawSprint) => (a.startDate ?? "9999").localeCompare(b.startDate ?? "9999")
+  const chosen =
+    sprints.find((s) => s.state === "active") ??
+    sprints.filter((s) => s.state === "future").sort(byStart)[0] ??
+    sprints.sort(byStart)[sprints.length - 1]
+  if (!chosen) return null
+  return {
+    id: chosen.id!,
+    name: chosen.name ?? `Sprint ${chosen.id}`,
+    state: chosen.state ?? "closed",
+    start: customDate(chosen.startDate),
+    end: customDate(chosen.endDate),
+  }
+}
+
+function mapDelivery(f: RawIssue["fields"], ids: CustomFieldIds): Delivery {
+  const val = (key: keyof CustomFieldIds) => (ids[key] ? f[ids[key]!] : undefined)
+  return {
+    beDev: customPerson(val("beDev")),
+    feDev: customPerson(val("feDev")),
+    beStart: customDate(val("beStart")),
+    beEnd: customDate(val("beEnd")),
+    feStart: customDate(val("feStart")),
+    feEnd: customDate(val("feEnd")),
+    qaStart: customDate(val("qaStart")),
+    qaEnd: customDate(val("qaEnd")),
+    beEstimate: customNumber(val("beEstimate")),
+    feEstimate: customNumber(val("feEstimate")),
+    qaEstimate: customNumber(val("qaEstimate")),
+    deployment: customDate(val("deployment")),
+    release: customDate(val("release")),
+    revisedRelease: customDate(val("revisedRelease")),
+    prdSignoff: customOption(val("prdSignoff")),
+    spmSignoff: customOption(val("spmSignoff")),
+    uatSignoff: customOption(val("uatSignoff")),
+    techFeasibility: customOption(val("techFeasibility")),
+  }
+}
+
+function mapIssue(raw: RawIssue, domain: string, ids: CustomFieldIds): IssueSummary {
   const f = raw.fields ?? {}
   return {
     key: raw.key,
@@ -186,6 +288,7 @@ function mapIssue(raw: RawIssue, domain: string, fields: CustomFieldIds): IssueS
     summary: f.summary ?? "(no summary)",
     type: f.issuetype?.name ?? "Issue",
     status: f.status?.name ?? "Unknown",
+    statusId: f.status?.id ?? "",
     statusCategory: category(f.status?.statusCategory?.key),
     priority: f.priority?.name ?? null,
     assignee: person(f.assignee),
@@ -195,28 +298,28 @@ function mapIssue(raw: RawIssue, domain: string, fields: CustomFieldIds): IssueS
     due: f.duedate ?? null,
     resolved: f.resolutiondate ?? null,
     labels: f.labels ?? [],
-    productOwner: fields.productOwner ? customPerson(f[fields.productOwner]) : null,
+    productOwner: ids.productOwner ? customPerson(f[ids.productOwner]) : null,
+    sprint: ids.sprint ? pickSprint(f[ids.sprint]) : null,
+    delivery: mapDelivery(f, ids),
     url: `${domain}/browse/${raw.key}`,
   }
-}
-
-function mapTransition(t: RawTransition): IssueTransition {
-  return { id: t.id, name: t.name, to: t.to?.name ?? t.name, toCategory: category(t.to?.statusCategory?.key) }
 }
 
 /* ----------------------------------------------------------------- reading */
 
 export async function searchIssues(ctx: JiraCtx, jql: string, max = 500): Promise<IssueSummary[]> {
   const custom = await customFieldIds(ctx)
-  const fields = [...LIST_FIELDS, ...(custom.productOwner ? [custom.productOwner] : [])]
+  const fields = requestedFields(custom)
   const raw: RawIssue[] = []
   try {
     // Jira Cloud's current search endpoint (token-based paging).
     let nextPageToken: string | undefined
     do {
       const page = await jiraRequest<{ issues?: RawIssue[]; nextPageToken?: string }>(ctx, "/rest/api/3/search/jql", {
-        method: "POST",
-        body: { jql, fields, maxResults: Math.min(100, max - raw.length), nextPageToken },
+        jql,
+        fields,
+        maxResults: Math.min(100, max - raw.length),
+        nextPageToken,
       })
       raw.push(...(page.issues ?? []))
       nextPageToken = page.nextPageToken
@@ -228,8 +331,10 @@ export async function searchIssues(ctx: JiraCtx, jql: string, max = 500): Promis
     let total = Infinity
     while (raw.length < max && startAt < total) {
       const page = await jiraRequest<{ issues: RawIssue[]; total: number }>(ctx, "/rest/api/2/search", {
-        method: "POST",
-        body: { jql, fields, maxResults: Math.min(100, max - raw.length), startAt },
+        jql,
+        fields,
+        maxResults: Math.min(100, max - raw.length),
+        startAt,
       })
       if (!page.issues.length) break
       raw.push(...page.issues)
@@ -240,18 +345,10 @@ export async function searchIssues(ctx: JiraCtx, jql: string, max = 500): Promis
   return raw.map((issue) => mapIssue(issue, ctx.domain, custom))
 }
 
-export async function getTransitions(ctx: JiraCtx, key: string): Promise<IssueTransition[]> {
-  const data = await jiraRequest<{ transitions?: RawTransition[] }>(ctx, `/rest/api/2/issue/${key}/transitions`)
-  return (data.transitions ?? []).map(mapTransition)
-}
-
 export async function getIssueDetail(ctx: JiraCtx, key: string): Promise<IssueDetail> {
   const custom = await customFieldIds(ctx)
-  const fields = [...LIST_FIELDS, "description", "comment", ...(custom.productOwner ? [custom.productOwner] : [])].join(",")
-  const [raw, transitions] = await Promise.all([
-    jiraRequest<RawIssue>(ctx, `/rest/api/2/issue/${key}?fields=${fields}`),
-    getTransitions(ctx, key),
-  ])
+  const fields = requestedFields(custom, ["description", "comment"]).join(",")
+  const raw = await jiraRequest<RawIssue>(ctx, `/rest/api/2/issue/${key}?fields=${fields}`)
   return {
     ...mapIssue(raw, ctx.domain, custom),
     description: raw.fields.description ?? "",
@@ -261,19 +358,7 @@ export async function getIssueDetail(ctx: JiraCtx, key: string): Promise<IssueDe
       body: c.body ?? "",
       created: c.created ?? "",
     })),
-    transitions,
   }
-}
-
-export async function searchAssignable(ctx: JiraCtx, key: string, query: string): Promise<Person[]> {
-  const params = new URLSearchParams({ issueKey: key, query, maxResults: "20" })
-  const users = await jiraRequest<RawPerson[]>(ctx, `/rest/api/2/user/assignable/search?${params}`)
-  return users.map(person).filter((p): p is Person => p !== null)
-}
-
-export async function getPriorities(ctx: JiraCtx): Promise<string[]> {
-  const list = await jiraRequest<{ name: string }[]>(ctx, "/rest/api/2/priority")
-  return list.map((p) => p.name)
 }
 
 export async function getMyself(ctx: JiraCtx): Promise<{ name: string; email: string | null }> {
@@ -281,26 +366,39 @@ export async function getMyself(ctx: JiraCtx): Promise<{ name: string; email: st
   return { name: me.displayName ?? "Unknown", email: me.emailAddress ?? null }
 }
 
-/* ----------------------------------------------------------------- writing */
+/* ----------------------------------------------------------- board columns */
 
-export async function transitionIssue(ctx: JiraCtx, key: string, transitionId: string) {
-  await jiraRequest(ctx, `/rest/api/2/issue/${key}/transitions`, {
-    method: "POST",
-    body: { transition: { id: transitionId } },
-  })
-}
+const boardCache = new Map<string, { at: number; config: Promise<BoardConfig | null> }>()
 
-export async function setAssignee(ctx: JiraCtx, key: string, accountId: string | null) {
-  await jiraRequest(ctx, `/rest/api/2/issue/${key}/assignee`, { method: "PUT", body: { accountId } })
-}
+/**
+ * The scrum board's column layout for one project, so the Board page can show
+ * the same columns (and column order) people see in Jira.
+ */
+export function getBoardConfig(ctx: JiraCtx, project: string): Promise<BoardConfig | null> {
+  const cacheKey = `${ctx.domain}|${project}`
+  const cached = boardCache.get(cacheKey)
+  if (cached && Date.now() - cached.at < 3600_000) return cached.config
 
-export async function setPriority(ctx: JiraCtx, key: string, priority: string) {
-  await jiraRequest(ctx, `/rest/api/2/issue/${key}`, {
-    method: "PUT",
-    body: { fields: { priority: { name: priority } } },
-  })
-}
-
-export async function addComment(ctx: JiraCtx, key: string, body: string) {
-  await jiraRequest(ctx, `/rest/api/2/issue/${key}/comment`, { method: "POST", body: { body } })
+  const config = (async () => {
+    const params = new URLSearchParams({ projectKeyOrId: project, type: "scrum", maxResults: "50" })
+    const boards = await jiraRequest<{ values?: { id: number; name: string }[] }>(ctx, `/rest/agile/1.0/board?${params}`)
+    const list = boards.values ?? []
+    const board = list.find((b) => b.name.trim().toLowerCase() === `${project.toLowerCase()} board`) ?? list[0]
+    if (!board) return null
+    const data = await jiraRequest<{ columnConfig?: { columns?: { name: string; statuses?: { id: string }[] }[] } }>(
+      ctx,
+      `/rest/agile/1.0/board/${board.id}/configuration`
+    )
+    return {
+      boardId: board.id,
+      boardName: board.name,
+      columns: (data.columnConfig?.columns ?? []).map((c) => ({
+        name: c.name.trim(),
+        statusIds: (c.statuses ?? []).map((s) => String(s.id)),
+      })),
+    }
+  })()
+  config.catch(() => boardCache.delete(cacheKey))
+  boardCache.set(cacheKey, { at: Date.now(), config })
+  return config
 }
