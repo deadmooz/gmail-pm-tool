@@ -276,6 +276,33 @@ export function Card({ className, children }: { className?: string; children: Re
   return <div className={cn("rounded-xl border border-slate-200 bg-white shadow-sm", className)}>{children}</div>
 }
 
+export function StatTile({
+  label,
+  value,
+  foot,
+  tone,
+}: {
+  label: string
+  value: string | number
+  foot: string
+  tone?: "alert" | "warn" | "good"
+}) {
+  return (
+    <Card className="p-5">
+      <p className="text-xs font-medium uppercase tracking-wide text-slate-500">{label}</p>
+      <p
+        className={cn(
+          "mt-2 text-3xl font-bold tabular-nums",
+          tone === "alert" ? "text-red-600" : tone === "warn" ? "text-amber-600" : tone === "good" ? "text-emerald-600" : "text-slate-900"
+        )}
+      >
+        {value}
+      </p>
+      <p className="mt-1 text-xs text-slate-500">{foot}</p>
+    </Card>
+  )
+}
+
 export const inputClass =
   "block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500 disabled:bg-slate-50"
 

@@ -2,7 +2,8 @@
 
 import { useMemo, useState } from "react"
 import { useIssues } from "@/hooks/useIssues"
-import { daysOverdue, PROJECTS, urgencyScore, type IssueSummary } from "@/lib/jira-types"
+import { useTeam } from "@/hooks/useTeam"
+import { daysOverdue, isBug, PROJECTS, urgencyScore, type IssueSummary } from "@/lib/jira-types"
 import { cn } from "@/lib/utils"
 import { IssueDrawer } from "@/components/IssueDrawer"
 import { PeopleChart, PriorityChart, StatusByProjectChart } from "@/components/DashboardCharts"
@@ -26,7 +27,6 @@ import {
 
 type DashScope = "sprint" | "open"
 
-const isBug = (i: IssueSummary) => i.type.toLowerCase() === "bug"
 const isOverdue = (i: IssueSummary) => (daysOverdue(i) ?? 0) > 0
 const notDone = (i: IssueSummary) => i.statusCategory !== "done"
 const pct = (n: number, d: number) => (d ? Math.round((n / d) * 100) : 0)
@@ -51,8 +51,8 @@ function Tile({ label, value, foot, tone }: { label: string; value: string | num
 function reasons(issue: IssueSummary): string[] {
   const out: string[] = []
   const overdue = daysOverdue(issue)
-  if (overdue !== null && overdue > 0) out.push(`${overdue}d overdue`)
-  else if (overdue !== null && overdue >= -3) out.push(overdue === 0 ? "due today" : `due in ${-overdue}d`)
+  if (overdue !== null && overdue > 0) out.push(`${overdue}d past deployment`)
+  else if (overdue !== null && overdue >= -3) out.push(overdue === 0 ? "deploys today" : `deploys in ${-overdue}d`)
   if (!issue.assignee) out.push("unassigned")
   return out
 }
@@ -61,7 +61,8 @@ export default function DashboardPage() {
   const [scope, setScope] = useState<DashScope>("sprint")
   const [project, setProject] = useState<ProjectFilter>("all")
   const [owner, setOwner] = useState("")
-  const { issues, error, loading, firstLoad, reload, patchIssue } = useIssues("all", scope)
+  const { issues, error, loading, firstLoad, reload } = useIssues("all", scope)
+  const team = useTeam()
   const [openKey, setOpenKey] = useState<string | null>(null)
 
   const inSprint = scope === "sprint"
@@ -177,7 +178,7 @@ export default function DashboardPage() {
               </>
             )}
             <Tile label="Open bugs" value={stats.bugs} foot={`${scopeNoun}, not done`} tone={stats.bugs ? "alert" : undefined} />
-            <Tile label="Overdue" value={stats.overdue} foot="past their due date" tone={stats.overdue ? "alert" : undefined} />
+            <Tile label="Overdue" value={stats.overdue} foot="not done, past deployment date" tone={stats.overdue ? "alert" : undefined} />
             <Tile label="Unassigned" value={stats.unassigned} foot="not done, no assignee" tone={stats.unassigned ? "warn" : undefined} />
           </div>
 
@@ -257,7 +258,7 @@ export default function DashboardPage() {
 
           <Card className="p-5">
             <h3 className="text-sm font-semibold text-slate-900">Needs attention</h3>
-            <p className="mb-3 text-xs text-slate-500">Top 10 remaining issues by priority, lateness and ownership</p>
+            <p className="mb-3 text-xs text-slate-500">Top 10 remaining issues by priority, deployment date and ownership</p>
             {attention.length === 0 ? (
               <p className="py-10 text-center text-sm text-slate-400">Nothing left to do here. Nice.</p>
             ) : (
@@ -296,7 +297,7 @@ export default function DashboardPage() {
         </>
       )}
 
-      <IssueDrawer issueKey={openKey} onClose={() => setOpenKey(null)} onChanged={patchIssue} />
+      <IssueDrawer issueKey={openKey} onClose={() => setOpenKey(null)} team={team.team} onTeamChanged={team.reload} />
     </div>
   )
 }

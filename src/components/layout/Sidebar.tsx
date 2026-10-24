@@ -3,13 +3,30 @@
 import Link from "next/link"
 import { usePathname } from "next/navigation"
 import { signOut } from "next-auth/react"
-import { Columns3, LayoutDashboard, ListTodo, LogOut, Settings, ShieldCheck } from "lucide-react"
+import {
+  CalendarClock,
+  ClipboardCheck,
+  Columns3,
+  GanttChart,
+  LayoutDashboard,
+  ListTodo,
+  LogOut,
+  Settings,
+  ShieldCheck,
+  Users,
+  UsersRound,
+} from "lucide-react"
 import { cn } from "@/lib/utils"
 
 const NAV = [
   { name: "Dashboard", href: "/", icon: LayoutDashboard },
+  { name: "Deployments", href: "/deployments", icon: CalendarClock },
+  { name: "People & Capacity", href: "/people", icon: Users },
+  { name: "Timeline", href: "/timeline", icon: GanttChart },
   { name: "Board", href: "/board", icon: Columns3 },
   { name: "Backlog", href: "/backlog", icon: ListTodo },
+  { name: "Data checklist", href: "/checklist", icon: ClipboardCheck },
+  { name: "Team setup", href: "/team", icon: UsersRound },
   { name: "My Settings", href: "/settings", icon: Settings },
 ]
 

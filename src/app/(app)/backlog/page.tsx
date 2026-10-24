@@ -3,8 +3,10 @@
 import { useMemo, useState } from "react"
 import { ArrowDown, ArrowUp } from "lucide-react"
 import { useIssues } from "@/hooks/useIssues"
+import { useTeam } from "@/hooks/useTeam"
 import {
   daysOverdue,
+  deadline,
   priorityRank,
   STATUS_CATEGORY_LABEL,
   STATUS_CATEGORY_ORDER,
@@ -43,7 +45,7 @@ const COLUMNS: { key: SortKey; label: string; className?: string }[] = [
   { key: "priority", label: "Priority", className: "w-28" },
   { key: "owner", label: "Product Owner", className: "w-44" },
   { key: "assignee", label: "Assignee", className: "w-44" },
-  { key: "due", label: "Due", className: "w-24" },
+  { key: "due", label: "Deploy", className: "w-24" },
   { key: "updated", label: "Updated", className: "w-24" },
 ]
 
@@ -69,7 +71,7 @@ function compare(a: IssueSummary, b: IssueSummary, sort: SortKey): number {
     case "assignee":
       return (a.assignee?.name ?? "~").localeCompare(b.assignee?.name ?? "~")
     case "due":
-      return (a.due ?? "9999").localeCompare(b.due ?? "9999")
+      return (deadline(a) ?? "9999").localeCompare(deadline(b) ?? "9999")
     case "updated":
       return b.updated.localeCompare(a.updated)
   }
@@ -80,7 +82,8 @@ const PAGE_SIZE = 100
 export default function BacklogPage() {
   const [project, setProject] = useState<ProjectFilter>("all")
   const [scope, setScope] = useState<IssueScope>("open")
-  const { issues, error, loading, firstLoad, reload, patchIssue } = useIssues(project, scope)
+  const { issues, error, loading, firstLoad, reload } = useIssues(project, scope)
+  const team = useTeam()
 
   const [query, setQuery] = useState("")
   const [category, setCategory] = useState("")
@@ -136,7 +139,8 @@ export default function BacklogPage() {
           onChange={setScope}
           options={[
             { value: "open", label: "Not done" },
-            { value: "sprint", label: "Active sprint" },
+            { value: "sprint", label: "Current sprint" },
+            { value: "next", label: "Next sprint" },
             { value: "recent", label: "Updated in 30 days" },
           ]}
         />
@@ -250,7 +254,7 @@ export default function BacklogPage() {
                         </span>
                       </td>
                       <td className={cn("px-4 py-2.5 whitespace-nowrap", overdue !== null && overdue > 0 ? "font-medium text-red-600" : "text-slate-600")}>
-                        {fmtDate(issue.due)}
+                        {fmtDate(deadline(issue))}
                       </td>
                       <td className="px-4 py-2.5 whitespace-nowrap text-slate-500">{timeAgo(issue.updated)}</td>
                     </tr>
@@ -270,7 +274,7 @@ export default function BacklogPage() {
         </Card>
       )}
 
-      <IssueDrawer issueKey={openKey} onClose={() => setOpenKey(null)} onChanged={patchIssue} />
+      <IssueDrawer issueKey={openKey} onClose={() => setOpenKey(null)} team={team.team} onTeamChanged={team.reload} />
     </div>
   )
 }

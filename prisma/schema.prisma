@@ -25,6 +25,49 @@ model User {
 
 // Single row (id = 1) holding settings shared by every user.
 model AppSettings {
-  id         Int     @id @default(1)
-  jiraDomain String?
+  id                 Int     @id @default(1)
+  jiraDomain         String?
+  defaultHoursPerDay Float   @default(8)
+  // Which Saturdays of the month are days off, e.g. "2,4,5". Sundays are always off.
+  saturdaysOff       String  @default("2,4,5")
+  // Share of each team's capacity held back for bugs, in percent.
+  bugBufferBE        Int     @default(0)
+  bugBufferFE        Int     @default(0)
+  bugBufferQA        Int     @default(0)
+}
+
+// ---- Planning data PM Board owns (Jira has no place for it) ----
+
+// A Jira person with a delivery role. Keyed by Jira accountId.
+model TeamMember {
+  accountId   String   @id
+  name        String
+  role        String // "BE" | "FE" | "QA"
+  hoursPerDay Float? // null = use AppSettings.defaultHoursPerDay
+  createdAt   DateTime @default(now())
+}
+
+model Holiday {
+  date String @id // YYYY-MM-DD
+  name String
+}
+
+model Leave {
+  id        String   @id @default(cuid())
+  accountId String
+  name      String
+  start     String // YYYY-MM-DD, inclusive
+  end       String // YYYY-MM-DD, inclusive
+  hours     Float? // hours off per day; null = full day
+  note      String?
+  createdBy String
+  createdAt DateTime @default(now())
+}
+
+// Who tests a card. Jira has no QA field, so this lives here.
+model QaAssignment {
+  issueKey  String   @id
+  accountId String
+  name      String
+  updatedAt DateTime @updatedAt
 }
