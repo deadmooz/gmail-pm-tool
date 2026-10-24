@@ -1,9 +1,10 @@
 import { NextAuthOptions } from "next-auth"
 import CredentialsProvider from "next-auth/providers/credentials"
-import { PrismaAdapter } from "@auth/prisma-adapter"
 import { timingSafeEqual } from "crypto"
 import { prisma } from "@/lib/prisma"
-import type { Adapter } from "next-auth/adapters"
+import { hashPassword, verifyPassword } from "@/lib/password"
+
+export const BOOTSTRAP_ADMIN_EMAIL = "admin@pm-tool.local"
 
 function safeEqual(a: string, b: string) {
   const bufA = Buffer.from(a)
@@ -11,46 +12,64 @@ function safeEqual(a: string, b: string) {
   return bufA.length === bufB.length && timingSafeEqual(bufA, bufB)
 }
 
+/**
+ * ADMIN_USERNAME / ADMIN_PASSWORD from .env always work as a break-glass
+ * admin login, so there is a way in before any users exist.
+ */
+async function bootstrapAdmin(login: string, password: string) {
+  const envUser = process.env.ADMIN_USERNAME
+  const envPass = process.env.ADMIN_PASSWORD
+  if (!envUser || !envPass) return null
+  if (!safeEqual(login, envUser) || !safeEqual(password, envPass)) return null
+
+  return prisma.user.upsert({
+    where: { email: BOOTSTRAP_ADMIN_EMAIL },
+    update: { role: "admin", status: "active" },
+    create: {
+      name: "Admin",
+      email: BOOTSTRAP_ADMIN_EMAIL,
+      passwordHash: await hashPassword(envPass),
+      role: "admin",
+    },
+  })
+}
+
 export const authOptions: NextAuthOptions = {
-  adapter: PrismaAdapter(prisma) as Adapter,
   providers: [
     CredentialsProvider({
-      name: "Admin Login",
+      name: "Email",
       credentials: {
-        username: { label: "Username", type: "text" },
+        login: { label: "Email", type: "text" },
         password: { label: "Password", type: "password" },
       },
       async authorize(credentials) {
-        const adminUser = process.env.ADMIN_USERNAME
-        const adminPass = process.env.ADMIN_PASSWORD
-        // Fail closed when credentials are not configured.
-        if (!adminUser || !adminPass || !credentials) return null
+        const login = credentials?.login?.trim().toLowerCase() ?? ""
+        const password = credentials?.password ?? ""
+        if (!login || !password) return null
 
-        if (
-          !safeEqual(credentials.username ?? "", adminUser) ||
-          !safeEqual(credentials.password ?? "", adminPass)
-        ) {
-          return null
-        }
+        const admin = await bootstrapAdmin(login, password)
+        if (admin) return { id: admin.id, name: admin.name, email: admin.email, role: admin.role }
 
-        const user = await prisma.user.upsert({
-          where: { email: "admin@pm-tool.local" },
-          update: {},
-          create: { name: "Admin User", email: "admin@pm-tool.local" },
-        })
-        return { id: user.id, name: user.name, email: user.email }
+        const user = await prisma.user.findUnique({ where: { email: login } })
+        if (!user || user.status !== "active") return null
+        if (!(await verifyPassword(password, user.passwordHash))) return null
+        return { id: user.id, name: user.name, email: user.email, role: user.role }
       },
     }),
   ],
   callbacks: {
+    async jwt({ token, user }) {
+      if (user) token.role = user.role
+      return token
+    },
     async session({ session, token }) {
-      if (session?.user && token?.sub) {
+      if (session.user && token.sub) {
         session.user.id = token.sub
+        session.user.role = token.role ?? "member"
       }
       return session
     },
   },
-  session: {
-    strategy: "jwt", // Credentials provider requires JWT session strategy
-  },
+  session: { strategy: "jwt" },
+  pages: { signIn: "/login" },
 }
