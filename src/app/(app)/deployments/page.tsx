@@ -1,7 +1,7 @@
 "use client"
 
 import { useMemo, useState } from "react"
-import { useIssues } from "@/hooks/useIssues"
+import { useFlow } from "@/hooks/useFlow"
 import { useTeam } from "@/hooks/useTeam"
 import {
   addDays,
@@ -14,9 +14,11 @@ import {
   type IssueSummary,
 } from "@/lib/jira-types"
 import { qaPerson } from "@/lib/capacity"
+import { forecastIssue, type Forecast } from "@/lib/flow"
 import type { TeamData } from "@/lib/team-types"
 import { cn } from "@/lib/utils"
 import { IssueDrawer } from "@/components/IssueDrawer"
+import { ForecastChip } from "@/components/ForecastChip"
 import {
   Card,
   ErrorBox,
@@ -57,12 +59,17 @@ export default function DeploymentsPage() {
   const [range, setRange] = useState<Range>("upcoming")
   const [owner, setOwner] = useState("")
   const [openKey, setOpenKey] = useState<string | null>(null)
-  const { issues, error, loading, firstLoad, reload } = useIssues(project, "deploy")
+  const { issues, flows, baseline, error, loading, firstLoad, reload } = useFlow(project, "deploy")
   const team = useTeam()
   const today = todayIso()
 
   const owners = useMemo(() => peopleOf(issues, (i) => i.productOwner), [issues])
   const scoped = useMemo(() => issues.filter((i) => matchesPerson(i.productOwner, owner)), [issues, owner])
+  const forecasts = useMemo(() => {
+    const out: Record<string, Forecast> = {}
+    issues.forEach((i) => (out[i.key] = forecastIssue(i, flows[i.key], baseline, today)))
+    return out
+  }, [issues, flows, baseline, today])
 
   const stats = useMemo(() => {
     const dep = (i: IssueSummary) => i.delivery.deployment
@@ -74,8 +81,19 @@ export default function DeploymentsPage() {
       late: scoped.filter((i) => (daysOverdue(i, today) ?? 0) > 0).length,
       qaLate: scoped.filter((i) => !isDone(i) && qaAfterDeployment(i)).length,
       noDate: scoped.filter((i) => !dep(i) && !isDone(i) && i.sprint?.state === "active").length,
+      atRisk: scoped.filter((i) => forecasts[i.key]?.status === "at-risk").length,
+      willSlip: scoped.filter((i) => forecasts[i.key]?.status === "will-slip").length,
     }
-  }, [scoped, today])
+  }, [scoped, today, forecasts])
+
+  // Not late yet, but on typical timings they won't make their deployment date.
+  const risky = useMemo(
+    () =>
+      scoped
+        .filter((i) => ["at-risk", "will-slip"].includes(forecasts[i.key]?.status))
+        .sort((a, b) => (forecasts[b.key].slipDays ?? 0) - (forecasts[a.key].slipDays ?? 0)),
+    [scoped, forecasts]
+  )
 
   const byDate = useMemo(() => {
     const [from, to] = range === "upcoming" ? [today, addDays(today, 42)] : [addDays(today, -14), addDays(today, -1)]
@@ -119,21 +137,37 @@ export default function DeploymentsPage() {
 
       {!error && !firstLoad && (
         <>
-          <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
+          <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
             <StatTile label="Deploying today" value={stats.today} foot={fmtDate(today)} />
             <StatTile label="This week" value={stats.thisWeek} foot="today + 6 days" />
             <StatTile label="Next week" value={stats.nextWeek} foot="7–13 days out" />
             <StatTile label="Past deployment" value={stats.late} foot="date passed, not done" tone={stats.late ? "alert" : undefined} />
             <StatTile label="QA after deploy" value={stats.qaLate} foot="QA ends after deployment" tone={stats.qaLate ? "alert" : undefined} />
             <StatTile label="No deployment date" value={stats.noDate} foot="in current sprint, not done" tone={stats.noDate ? "warn" : undefined} />
+            <StatTile label="Forecast: will slip" value={stats.willSlip} foot="likely done 3+ days after deployment" tone={stats.willSlip ? "alert" : undefined} />
+            <StatTile label="Forecast: at risk" value={stats.atRisk} foot="likely 1–2 days after deployment" tone={stats.atRisk ? "warn" : undefined} />
           </div>
+
+          {risky.length > 0 && (
+            <Card className="border-amber-200 p-5">
+              <h2 className="text-sm font-semibold text-amber-800">Likely to miss their deployment date ({risky.length})</h2>
+              <p className="mb-2 text-xs text-slate-500">
+                Predicted from where each card is in its workflow and how long each remaining phase typically takes (last 90 days). See Flow &amp; QA for the typical times.
+              </p>
+              <ul className="divide-y divide-slate-100">
+                {risky.map((i) => (
+                  <DeployRow key={i.key} issue={i} team={team.team} today={today} forecast={forecasts[i.key]} onOpen={() => setOpenKey(i.key)} showDate />
+                ))}
+              </ul>
+            </Card>
+          )}
 
           {late.length > 0 && (
             <Card className="border-red-200 p-5">
               <h2 className="text-sm font-semibold text-red-700">Past their deployment date and not done ({late.length})</h2>
               <ul className="mt-2 divide-y divide-slate-100">
                 {late.map((i) => (
-                  <DeployRow key={i.key} issue={i} team={team.team} today={today} onOpen={() => setOpenKey(i.key)} showDate />
+                  <DeployRow key={i.key} issue={i} team={team.team} today={today} forecast={forecasts[i.key]} onOpen={() => setOpenKey(i.key)} showDate />
                 ))}
               </ul>
             </Card>
@@ -170,7 +204,7 @@ export default function DeploymentsPage() {
                       </div>
                       <ul className="divide-y divide-slate-100">
                         {list.map((i) => (
-                          <DeployRow key={i.key} issue={i} team={team.team} today={today} onOpen={() => setOpenKey(i.key)} />
+                          <DeployRow key={i.key} issue={i} team={team.team} today={today} forecast={forecasts[i.key]} onOpen={() => setOpenKey(i.key)} />
                         ))}
                       </ul>
                     </div>
@@ -186,7 +220,7 @@ export default function DeploymentsPage() {
               <p className="mb-2 text-xs text-slate-500">These can&apos;t be planned or tracked until a Deployment Date is set in Jira.</p>
               <ul className="divide-y divide-slate-100">
                 {noDate.map((i) => (
-                  <DeployRow key={i.key} issue={i} team={team.team} today={today} onOpen={() => setOpenKey(i.key)} />
+                  <DeployRow key={i.key} issue={i} team={team.team} today={today} forecast={forecasts[i.key]} onOpen={() => setOpenKey(i.key)} />
                 ))}
               </ul>
             </Card>
@@ -203,12 +237,14 @@ function DeployRow({
   issue,
   team,
   today,
+  forecast,
   onOpen,
   showDate,
 }: {
   issue: IssueSummary
   team: TeamData | null
   today: string
+  forecast?: Forecast
   onOpen: () => void
   showDate?: boolean
 }) {
@@ -247,6 +283,7 @@ function DeployRow({
             ))}
           </span>
         </span>
+        {forecast && forecast.status !== "late" && forecast.status !== "no-date" && <ForecastChip forecast={forecast} />}
         <StatusPill status={issue.status} category={issue.statusCategory} />
       </button>
     </li>

@@ -56,7 +56,7 @@ export async function jiraRequest<T>(ctx: JiraCtx, path: string, body?: unknown)
   let res: Response
   try {
     res = await fetch(ctx.domain + path, {
-      // POST is only used for search, which reads.
+      // POST is only used for search and bulk history lookups, which read.
       method: body !== undefined ? "POST" : "GET",
       headers: {
         Authorization: ctx.auth,
@@ -118,6 +118,9 @@ const CUSTOM_FIELD_NAMES = {
   spmSignoff: ["spm signoff"],
   uatSignoff: ["uat signoff"],
   techFeasibility: ["technical feasibility"],
+  qaReview: ["qa test case review"],
+  qaReviewPm: ["qa test case review for pm"],
+  qaReviewDev: ["qa test case review for dev"],
 } as const
 
 export type CustomFieldIds = Record<keyof typeof CUSTOM_FIELD_NAMES, string | null>
@@ -173,6 +176,7 @@ interface RawSprint {
 }
 
 interface RawIssue {
+  id: string
   key: string
   fields: Record<string, unknown> & {
     summary?: string
@@ -277,12 +281,16 @@ function mapDelivery(f: RawIssue["fields"], ids: CustomFieldIds): Delivery {
     spmSignoff: customOption(val("spmSignoff")),
     uatSignoff: customOption(val("uatSignoff")),
     techFeasibility: customOption(val("techFeasibility")),
+    qaReview: customOption(val("qaReview")),
+    qaReviewPm: customOption(val("qaReviewPm")),
+    qaReviewDev: customOption(val("qaReviewDev")),
   }
 }
 
 function mapIssue(raw: RawIssue, domain: string, ids: CustomFieldIds): IssueSummary {
   const f = raw.fields ?? {}
   return {
+    id: String(raw.id),
     key: raw.key,
     project: f.project?.key ?? raw.key.split("-")[0],
     summary: f.summary ?? "(no summary)",
@@ -300,6 +308,9 @@ function mapIssue(raw: RawIssue, domain: string, ids: CustomFieldIds): IssueSumm
     labels: f.labels ?? [],
     productOwner: ids.productOwner ? customPerson(f[ids.productOwner]) : null,
     sprint: ids.sprint ? pickSprint(f[ids.sprint]) : null,
+    sprintIds: ids.sprint && Array.isArray(f[ids.sprint])
+      ? (f[ids.sprint] as RawSprint[]).map((s) => s.id).filter((id): id is number => typeof id === "number")
+      : [],
     delivery: mapDelivery(f, ids),
     url: `${domain}/browse/${raw.key}`,
   }
@@ -364,6 +375,104 @@ export async function getIssueDetail(ctx: JiraCtx, key: string): Promise<IssueDe
 export async function getMyself(ctx: JiraCtx): Promise<{ name: string; email: string | null }> {
   const me = await jiraRequest<{ displayName?: string; emailAddress?: string }>(ctx, "/rest/api/2/myself")
   return { name: me.displayName ?? "Unknown", email: me.emailAddress ?? null }
+}
+
+/* ---------------------------------------------------------- status history */
+
+export interface StatusChange {
+  /** ISO timestamp of the change. */
+  at: string
+  from: string
+  to: string
+}
+
+/**
+ * Status changes for many issues at once, keyed by issue id, oldest first.
+ * Uses Jira Cloud's bulk changelog endpoint; on Jira versions without it,
+ * returns an empty map and the history-based views say so.
+ */
+export async function statusHistories(ctx: JiraCtx, issueIds: string[]): Promise<Map<string, StatusChange[]>> {
+  const out = new Map<string, StatusChange[]>()
+  for (let i = 0; i < issueIds.length; i += 1000) {
+    const chunk = issueIds.slice(i, i + 1000)
+    let nextPageToken: string | undefined
+    do {
+      let page: {
+        issueChangeLogs?: {
+          issueId: string
+          changeHistories?: { created: number | string; items?: { fieldId?: string; field?: string; fromString?: string; toString?: string }[] }[]
+        }[]
+        nextPageToken?: string
+      }
+      try {
+        page = await jiraRequest(ctx, "/rest/api/3/changelog/bulkfetch", {
+          issueIdsOrKeys: chunk,
+          fieldIds: ["status"],
+          maxResults: 1000,
+          nextPageToken,
+        })
+      } catch (err) {
+        if (err instanceof HttpError && [404, 405, 410].includes(err.status)) return out
+        throw err
+      }
+      for (const log of page.issueChangeLogs ?? []) {
+        const list = out.get(String(log.issueId)) ?? []
+        for (const h of log.changeHistories ?? []) {
+          const at = new Date(typeof h.created === "number" ? h.created : Date.parse(h.created)).toISOString()
+          for (const item of h.items ?? []) {
+            if ((item.fieldId ?? item.field) !== "status") continue
+            list.push({ at, from: item.fromString ?? "", to: item.toString ?? "" })
+          }
+        }
+        out.set(String(log.issueId), list)
+      }
+      nextPageToken = page.nextPageToken
+    } while (nextPageToken)
+  }
+  for (const list of out.values()) list.sort((a, b) => a.at.localeCompare(b.at))
+  return out
+}
+
+/* ---------------------------------------------------------- closed sprints */
+
+export interface SprintInfo {
+  id: number
+  name: string
+  state: string
+  start: string | null
+  end: string | null
+  completed: string | null
+}
+
+/** The most recent closed sprints of a project's scrum board (newest last). */
+export async function recentClosedSprints(ctx: JiraCtx, project: string, count: number): Promise<SprintInfo[]> {
+  const board = await getBoardConfig(ctx, project)
+  if (!board) return []
+  const all: SprintInfo[] = []
+  let startAt = 0
+  for (let page = 0; page < 20; page++) {
+    const data = await jiraRequest<{
+      values?: { id: number; name: string; state: string; startDate?: string; endDate?: string; completeDate?: string }[]
+      isLast?: boolean
+    }>(ctx, `/rest/agile/1.0/board/${board.boardId}/sprint?state=closed&maxResults=50&startAt=${startAt}`)
+    const values = data.values ?? []
+    all.push(
+      ...values.map((s) => ({
+        id: s.id,
+        name: s.name,
+        state: s.state,
+        start: customDate(s.startDate),
+        end: customDate(s.endDate),
+        completed: customDate(s.completeDate),
+      }))
+    )
+    if (data.isLast !== false || !values.length) break
+    startAt += values.length
+  }
+  return all
+    .filter((s) => s.completed)
+    .sort((a, b) => (a.completed ?? "").localeCompare(b.completed ?? ""))
+    .slice(-count)
 }
 
 /* ----------------------------------------------------------- board columns */

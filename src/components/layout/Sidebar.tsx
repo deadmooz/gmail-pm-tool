@@ -4,13 +4,16 @@ import Link from "next/link"
 import { usePathname } from "next/navigation"
 import { signOut } from "next-auth/react"
 import {
+  Activity,
   CalendarClock,
   ClipboardCheck,
   Columns3,
   GanttChart,
+  History,
   LayoutDashboard,
   ListTodo,
   LogOut,
+  MessageSquareText,
   Settings,
   ShieldCheck,
   Users,
@@ -23,6 +26,9 @@ const NAV = [
   { name: "Deployments", href: "/deployments", icon: CalendarClock },
   { name: "People & Capacity", href: "/people", icon: Users },
   { name: "Timeline", href: "/timeline", icon: GanttChart },
+  { name: "Flow & QA", href: "/flow", icon: Activity },
+  { name: "Sprint history", href: "/history", icon: History },
+  { name: "Updates", href: "/updates", icon: MessageSquareText },
   { name: "Board", href: "/board", icon: Columns3 },
   { name: "Backlog", href: "/backlog", icon: ListTodo },
   { name: "Data checklist", href: "/checklist", icon: ClipboardCheck },
