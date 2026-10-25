@@ -8,7 +8,11 @@ Jira stays the place where work is created and moved; PM Board never writes to J
 - **Dashboard** – current sprint (or all open work): progress, open bugs, work past its deployment date, unassigned work, per-project table, charts by priority, Product Owner and assignee, and a "needs attention" list.
 - **Deployments** – what deploys today, this week and next, cards past their Deployment Date, QA ending after deployment, cards with no deployment date, and release dates that moved.
 - **People & Capacity** – per person and per role (back-end, front-end, QA): capacity for the sprint, bug buffer, planned hours, utilisation, free hours in the next 7 days and when they free up. "From today" counts only work still owed.
-- **Timeline** – back-end, front-end and QA windows per card with deployment markers, grouped by project or by person.
+- **Timeline** – back-end, front-end and QA windows per card with deployment markers, grouped by project or by person, for any date range.
+- **Flow & QA** – real time spent in development, waiting for QA, QA and UAT/release (from Jira status history), the QA queue and how long each card has waited, cards stuck longer than usual, cards sent back from QA, QA test case review coverage, and actual time per person.
+- **Sprint history** – the last six closed sprints per project: issues finished in the sprint, carried over, hours planned vs done, and actual vs planned time for development and QA.
+- **Updates** – a ready-to-copy daily delivery update and a weekly summary per Product Owner (PM Board never sends anything itself).
+- **Deployment forecast** – on Deployments, each card is marked on track, at risk or likely to slip, from where it is in its workflow and how long each remaining phase typically takes (last 90 days).
 - **Board** – the Jira scrum boards' own columns, read-only.
 - **Backlog** – sortable, filterable issue list.
 - **Data checklist** – missing Jira data (dates, estimates, developers, sign-offs) grouped by Product Owner.

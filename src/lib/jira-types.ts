@@ -55,9 +55,15 @@ export interface Delivery {
   spmSignoff: string | null
   uatSignoff: string | null
   techFeasibility: string | null
+  /** QA test case review fields ("Done" / "Yes" / "Not Required" / empty). */
+  qaReview: string | null
+  qaReviewPm: string | null
+  qaReviewDev: string | null
 }
 
 export interface IssueSummary {
+  /** Jira's numeric issue id (needed for status-history lookups). */
+  id: string
   key: string
   project: string
   summary: string
@@ -75,6 +81,8 @@ export interface IssueSummary {
   labels: string[]
   productOwner: Person | null
   sprint: SprintRef | null
+  /** Every sprint the issue has been in (for carry-over and sprint history). */
+  sprintIds: number[]
   delivery: Delivery
   url: string
 }
